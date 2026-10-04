@@ -21,55 +21,36 @@ struct GifWallApp: App {
 struct PanelView: View {
     @EnvironmentObject private var c: WallpaperController
     @State private var dropTargeted = false
+    @State private var renaming: WallpaperItem?
+    @State private var newName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Живые обои").font(.system(size: 13, weight: .semibold))
-                    Text(c.enabled ? "Включены" : "Выключены · стандартные обои")
+                    Text(subtitle)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 Spacer()
                 Toggle("", isOn: Binding(get: { c.enabled }, set: { c.enabled = $0 }))
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .disabled(c.busy != nil || !c.hasVideo)
             }
 
             preview
                 .opacity(c.enabled ? 1 : 0.45)
                 .saturation(c.enabled ? 1 : 0)
                 .animation(.easeOut(duration: 0.2), value: c.enabled)
+
             if !c.archiveItems.isEmpty {
                 archivePicker
-            } else if !c.sourceName.isEmpty {
-                Text(c.sourceName)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            } else if !c.items.isEmpty {
+                library
             }
-
-            VStack(spacing: 10) {
-                // Title above the picker: side by side, the three segments leave no room for it.
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Экран блокировки").font(.system(size: 13))
-                    Picker("", selection: Binding(get: { c.lockMode }, set: { c.lockMode = $0 })) {
-                        ForEach(LockMode.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .controlSize(.small)
-                }
-                row("Запуск при входе") {
-                    Toggle("", isOn: Binding(get: { c.launchAtLogin }, set: { c.setLaunchAtLogin($0) }))
-                        .labelsHidden().toggleStyle(.switch).controlSize(.small)
-                }
-            }
-            .disabled(c.busy != nil)
-            .opacity(c.enabled ? 1 : 0.6)
 
             if let warning = c.warning, c.error == nil {
                 Text(warning)
@@ -85,29 +66,45 @@ struct PanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            row("Запуск при входе") {
+                Toggle("", isOn: Binding(get: { c.launchAtLogin }, set: { c.setLaunchAtLogin($0) }))
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+            }
+
             Divider().opacity(0.5)
 
-            HStack {
-                Button("Выбрать файл…") { c.openPanel() }
-                    .buttonStyle(.borderless)
+            HStack(spacing: 14) {
+                Button("Добавить…") { c.openPanel() }
                     .disabled(c.busy != nil)
+                Button("Системные настройки") { c.openSystemSettings() }
                 Spacer()
                 Button("Выйти") { NSApp.terminate(nil) }
-                    .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
             }
+            .buttonStyle(.borderless)
             .font(.system(size: 12))
         }
         .padding(16)
-        .frame(width: 300)
+        .frame(width: 320)
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: drop)
+        .sheet(item: $renaming) { item in renameSheet(item) }
     }
+
+    private var subtitle: String {
+        if !c.enabled { return "Выключены" }
+        if let item = c.selected { return item.name }
+        return c.items.isEmpty ? "Добавьте видео или GIF" : "Выберите обои ниже или в Системных настройках"
+    }
+
+    // MARK: preview
 
     private var preview: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(.quaternary.opacity(0.5))
-            if c.hasVideo {
-                LoopingVideo(url: AppPaths.video, version: c.videoVersion)
+            if let item = c.selected {
+                LoopingVideo(url: item.video)
+                    .id(item.id)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             } else {
                 VStack(spacing: 6) {
@@ -139,16 +136,58 @@ struct PanelView: View {
         }
         .frame(height: 168)
         .contentShape(Rectangle())
-        .onTapGesture { if c.busy == nil { c.openPanel() } }
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            guard let p = providers.first else { return false }
-            _ = p.loadObject(ofClass: URL.self) { url, _ in
-                guard let url else { return }
-                Task { @MainActor in c.choose(url) }
-            }
-            return true
-        }
+        .onTapGesture { if c.busy == nil && c.items.isEmpty { c.openPanel() } }
     }
+
+    // MARK: library
+
+    private var library: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Мои обои · \(c.items.count)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            ScrollView {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                    ForEach(c.items) { item in
+                        LibraryTile(item: item, selected: item.id == c.selectedID) { c.select(item) }
+                            .contextMenu {
+                                Button("Переименовать…") { newName = item.name; renaming = item }
+                                Button("Удалить", role: .destructive) { c.remove(item) }
+                            }
+                    }
+                }
+                .padding(2)
+            }
+            .frame(maxHeight: 190)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(c.busy != nil)
+    }
+
+    private func renameSheet(_ item: WallpaperItem) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Название обоев").font(.system(size: 13, weight: .semibold))
+            TextField("", text: $newName)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { commitRename(item) }
+            HStack {
+                Spacer()
+                Button("Отмена") { renaming = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Сохранить") { commitRename(item) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private func commitRename(_ item: WallpaperItem) {
+        c.rename(item, to: newName)
+        renaming = nil
+    }
+
+    // MARK: archive
 
     private var archivePicker: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -157,6 +196,9 @@ struct PanelView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Добавить все") { c.addFromArchive(c.archiveItems) }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 11))
                 Button("Отмена") { c.cancelArchive() }
                     .buttonStyle(.borderless)
                     .font(.system(size: 11))
@@ -166,7 +208,7 @@ struct PanelView: View {
                 VStack(spacing: 2) {
                     ForEach(c.archiveItems, id: \.self) { url in
                         ArchiveRow(title: c.archiveLabel(url), isVideo: MediaConverter.isVideo(url)) {
-                            c.chooseFromArchive(url)
+                            c.addFromArchive([url])
                         }
                     }
                 }
@@ -176,12 +218,64 @@ struct PanelView: View {
         }
     }
 
+    private func drop(_ providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
+        let group = DispatchGroup()
+        var urls: [URL] = []
+        let lock = NSLock()
+        for p in providers {
+            group.enter()
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                if let url { lock.lock(); urls.append(url); lock.unlock() }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { c.add(urls) }
+        return true
+    }
+
     private func row<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         HStack {
             Text(title).font(.system(size: 13))
             Spacer()
             content()
         }
+    }
+}
+
+struct LibraryTile: View {
+    let item: WallpaperItem
+    let selected: Bool
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 4) {
+                Color.clear
+                    .aspectRatio(16 / 10, contentMode: .fit)
+                    .overlay {
+                        if let image = NSImage(contentsOf: item.thumbnail) {
+                            Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+                        }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(selected ? Color.accentColor : Color.primary.opacity(hover ? 0.25 : 0.08),
+                                          lineWidth: selected ? 2 : 1)
+                    }
+                Text(item.name)
+                    .font(.system(size: 10))
+                    .foregroundStyle(selected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(item.name)
     }
 }
 
@@ -214,24 +308,23 @@ struct ArchiveRow: View {
     }
 }
 
-/// Muted looping preview of the converted video.
+/// Muted looping preview of a library video.
 struct LoopingVideo: NSViewRepresentable {
     let url: URL
-    let version: Int
 
     final class PlayerView: NSView {
         let player = AVQueuePlayer()
         var looper: AVPlayerLooper?
-        var version = -1
 
-        override init(frame: NSRect) {
-            super.init(frame: frame)
+        init(url: URL) {
+            super.init(frame: .zero)
             wantsLayer = true
             let layer = AVPlayerLayer(player: player)
             layer.videoGravity = .resizeAspectFill
             self.layer = layer
             player.isMuted = true
             player.preventsDisplaySleepDuringVideoPlayback = false
+            looper = AVPlayerLooper(player: player, templateItem: AVPlayerItem(url: url))
         }
 
         required init?(coder: NSCoder) { fatalError() }
@@ -243,16 +336,9 @@ struct LoopingVideo: NSViewRepresentable {
         }
     }
 
-    func makeNSView(context: Context) -> PlayerView { PlayerView() }
+    func makeNSView(context: Context) -> PlayerView { PlayerView(url: url) }
 
-    func updateNSView(_ v: PlayerView, context: Context) {
-        guard v.version != version else { return }
-        v.version = version
-        v.looper?.disableLooping()
-        v.player.removeAllItems()
-        v.looper = AVPlayerLooper(player: v.player, templateItem: AVPlayerItem(url: url))
-        if v.window != nil { v.player.play() }
-    }
+    func updateNSView(_ v: PlayerView, context: Context) {}
 
     static func dismantleNSView(_ v: PlayerView, coordinator: ()) {
         v.player.pause()
@@ -261,10 +347,9 @@ struct LoopingVideo: NSViewRepresentable {
     }
 }
 
-/// Leaves the system as if GifWall had never run: on quit (menu, ⌘Q, logout, shutdown) the original
-/// wallpaper is restored before the process exits. The next launch applies the live wallpaper again.
+/// On quit only the live desktop stops: the library stays in System Settings (lock screen and screen saver
+/// keep playing it). Everything is removed from the system only on uninstall, see UninstallWatcher.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var replied = false
     private var uninstallWatcher: UninstallWatcher?
 
     @MainActor
@@ -273,19 +358,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uninstallWatcher?.start()
     }
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        Task { @MainActor in
-            await WallpaperController.shared.restoreSystem()
-            self.reply(sender)
-        }
-        // Never hold up logout/shutdown; whatever didn't finish is completed on the next launch.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.reply(sender) }
-        return .terminateLater
+    @MainActor
+    func applicationWillTerminate(_ notification: Notification) {
+        WallpaperController.shared.stopDesktop()
     }
 
-    private func reply(_ sender: NSApplication) {
-        guard !replied else { return }
-        replied = true
-        sender.reply(toApplicationShouldTerminate: true)
+    /// Files dropped on the app icon or opened with GifWall from Finder go into the library.
+    @MainActor
+    func application(_ application: NSApplication, open urls: [URL]) {
+        WallpaperController.shared.add(urls)
     }
 }

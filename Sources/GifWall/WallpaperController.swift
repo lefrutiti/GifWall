@@ -9,26 +9,11 @@ enum AppPaths {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
-    static let video = support.appendingPathComponent("current.mov")
-    static let still = support.appendingPathComponent("still.png")
-}
-
-enum LockMode: String, CaseIterable, Identifiable {
-    case off, still, animated
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .off: return "Нет"
-        case .still: return "Кадр"
-        case .animated: return "Анимация"
-        }
-    }
 }
 
 @MainActor
 final class WallpaperController: ObservableObject {
-    /// Master switch. Off: animation stops and the user's original system wallpaper comes back;
-    /// the chosen file and the other settings are kept for when it's turned on again.
+    /// Master switch for the live desktop. The library stays in System Settings either way.
     @AppStorage("enabled") private var enabledStored = true
     var enabled: Bool {
         get { enabledStored }
@@ -36,14 +21,13 @@ final class WallpaperController: ObservableObject {
             guard newValue != enabledStored else { return }
             enabledStored = newValue
             objectWillChange.send()
-            Task { await applyEnabled() }
+            applyDesktop()
         }
     }
-    @AppStorage("lockMode") private var lockModeRaw = LockMode.still.rawValue
-    @AppStorage("gifName") private(set) var sourceName = ""
 
-    /// Bumped whenever the video is replaced, so the preview player reloads.
-    @Published private(set) var videoVersion = 0
+    @Published private(set) var items: [WallpaperItem] = []
+    /// Our wallpaper chosen in System Settings (or in the panel); nil when the user picked something else.
+    @Published private(set) var selectedID: String?
     @Published private(set) var busy: String?
     @Published private(set) var progress: Double?
     /// Files found in a dropped archive, waiting for the user to pick one.
@@ -53,108 +37,124 @@ final class WallpaperController: ObservableObject {
     @Published private(set) var warning: String?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
-    var lockMode: LockMode {
-        get { LockMode(rawValue: lockModeRaw) ?? .still }
-        set {
-            let old = lockMode
-            lockModeRaw = newValue.rawValue
-            objectWillChange.send()
-            Task { await applyLock(previous: old) }
-        }
-    }
+    var selected: WallpaperItem? { items.first { $0.id == selectedID } }
 
-    var hasVideo: Bool { FileManager.default.fileExists(atPath: AppPaths.video.path) }
-
+    private let library = WallpaperLibrary()
     private let desktop = DesktopWallpaper()
+    private var storeWatcher: DirectoryWatcher?
+    /// Files queued by a multi-file drop or open panel.
+    private var queue: [(url: URL, name: String?)] = []
 
     static let shared = WallpaperController()
 
     private init() {
-        // Pre-video versions kept the source GIF next to the video; it's no longer needed.
-        try? FileManager.default.removeItem(at: AppPaths.support.appendingPathComponent("current.gif"))
         ArchiveExtractor.cleanup()
         Task {
-            // A crash or force-quit skips the restore on exit; finish it now so we start from the original.
-            if LockScreenWallpaper.needsRestore {
-                await LockScreenWallpaper.restoreOriginal()
-            }
-            cleanupStills()
-            // System changes are undone on every quit, so they are re-applied on every launch.
-            if hasVideo && enabled {
-                applyDesktop()
-                await applyLock(previous: .off)
-            }
-            await optimizeExistingVideo()
+            await library.migrateLegacy()
+            items = library.items
+            await SystemWallpaper.sync(items)
+            // Picking happens in System Settings: follow the wallpaper store.
+            storeWatcher = DirectoryWatcher(SystemWallpaper.storeDir) { [weak self] in self?.refreshSelection() }
+            refreshSelection()
+            await optimizeExisting()
         }
     }
 
-    /// Videos chosen with older versions were kept at full size and frame rate; shrink them once, like new files are.
-    private func optimizeExistingVideo() async {
-        guard hasVideo, busy == nil,
-              await MediaConverter.needsOptimizing(AppPaths.video, screen: Self.screenSize()) else { return }
-        busy = "Оптимизация…"
-        progress = 0
-        let fm = FileManager.default
-        let video = AppPaths.support.appendingPathComponent("incoming.mov")
-        do {
-            try await MediaConverter.convert(AppPaths.video, to: video, screen: Self.screenSize()) { value in
-                Task { @MainActor [weak self] in
-                    if self?.busy != nil { self?.progress = value }
+    // MARK: selection
+
+    /// Reads which wallpaper System Settings shows and plays it (or nothing, if it isn't ours).
+    private func refreshSelection() {
+        let id = SystemWallpaper.selectedID()
+        guard id != selectedID || !desktop.isShowing(selected?.video) else { return }
+        selectedID = id
+        applyDesktop()
+    }
+
+    func select(_ item: WallpaperItem) {
+        guard item.id != selectedID else { return }
+        error = nil
+        selectedID = item.id
+        applyDesktop()
+        do { try SystemWallpaper.select(item.id) } catch { self.error = error.localizedDescription }
+    }
+
+    private func applyDesktop() {
+        if enabled, let item = selected { desktop.show(video: item.video) } else { desktop.hide() }
+    }
+
+    // MARK: library
+
+    func remove(_ item: WallpaperItem) {
+        library.remove(item)
+        items = library.items
+        if selectedID == item.id {
+            selectedID = nil
+            applyDesktop()
+        }
+        Task {
+            await SystemWallpaper.sync(items)   // also re-points System Settings if it showed this one
+            refreshSelection()
+        }
+    }
+
+    func rename(_ item: WallpaperItem, to name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != item.name else { return }
+        library.rename(item, to: name)
+        items = library.items
+        Task { await SystemWallpaper.sync(items) }
+    }
+
+    /// Videos added with older versions were kept at full size and frame rate; shrink them once, like new files are.
+    private func optimizeExisting() async {
+        for item in items where busy == nil {
+            guard await MediaConverter.needsOptimizing(item.video, screen: Self.screenSize()) else { continue }
+            busy = "Оптимизация…"
+            progress = 0
+            let tmp = AppPaths.support.appendingPathComponent("incoming.mov")
+            do {
+                try await MediaConverter.convert(item.video, to: tmp, screen: Self.screenSize()) { value in
+                    Task { @MainActor [weak self] in if self?.busy != nil { self?.progress = value } }
                 }
+                desktop.hide()
+                try await library.replaceVideo(of: item, with: tmp)
+                SystemWallpaper.invalidate(item.id)
+                await SystemWallpaper.sync(items)
+                applyDesktop()
+            } catch {
+                // Not worth bothering the user: the old video keeps working as before.
+                try? FileManager.default.removeItem(at: tmp)
             }
-            try? fm.removeItem(at: AppPaths.video)
-            try fm.moveItem(at: video, to: AppPaths.video)
             busy = nil
             progress = nil
-            videoVersion += 1
-            if enabled {
-                applyDesktop()
-                await applyLock(previous: lockMode)
-            }
-        } catch {
-            // Not worth bothering the user: the old video keeps working as before.
-            try? fm.removeItem(at: video)
         }
-        busy = nil
-        progress = nil
     }
 
-    /// Undo everything GifWall changed in the system (on quit). Settings and the chosen file are kept.
-    func restoreSystem() async {
-        desktop.hide()
-        await LockScreenWallpaper.restoreOriginal()
-        cleanupStills()
-    }
+    // MARK: adding
 
-    private func applyEnabled() async {
+    func add(_ urls: [URL]) {
         error = nil
-        applyDesktop()
-        if enabled {
-            await applyLock(previous: .off)
-        } else {
-            await LockScreenWallpaper.restoreOriginal()
-            cleanupStills()
-        }
-    }
-
-    func choose(_ url: URL) {
+        warning = nil
         cancelArchive()
-        if ArchiveExtractor.isArchive(url) {
-            Task { await openArchive(url) }
-            return
+        for url in urls {
+            if ArchiveExtractor.isArchive(url) {
+                if urls.count == 1 { Task { await openArchive(url) } }
+                else { queue.append((url, nil)) }
+            } else if MediaConverter.isSupported(url) {
+                queue.append((url, nil))
+            }
         }
-        guard MediaConverter.isSupported(url) else {
+        if queue.isEmpty, archiveItems.isEmpty, busy == nil, urls.count > 0, !urls.contains(where: ArchiveExtractor.isArchive) {
             error = MediaConverterError.unsupported.localizedDescription
-            return
         }
-        Task { await load(url) }
+        Task { await drainQueue() }
     }
 
-    func chooseFromArchive(_ url: URL) {
-        let name = "\(archiveName) › \(url.lastPathComponent)"
+    func addFromArchive(_ urls: [URL]) {
         archiveItems = []
+        queue.append(contentsOf: urls.map { ($0, Optional($0.deletingPathExtension().lastPathComponent)) })
         Task {
-            await load(url, displayName: name)
+            await drainQueue()
             ArchiveExtractor.cleanup()
         }
     }
@@ -172,14 +172,13 @@ final class WallpaperController: ObservableObject {
     }
 
     private func openArchive(_ url: URL) async {
-        error = nil
         busy = "Распаковка…"
         do {
             let files = try await ArchiveExtractor.extract(url)
             busy = nil
             archiveName = url.lastPathComponent
             if files.count == 1 {
-                chooseFromArchive(files[0])
+                addFromArchive(files)
             } else {
                 archiveItems = files
             }
@@ -189,13 +188,68 @@ final class WallpaperController: ObservableObject {
         }
     }
 
+    /// Converts queued files one by one; the last added becomes the wallpaper.
+    private func drainQueue() async {
+        guard busy == nil else { return }
+        var added: WallpaperItem?
+        while !queue.isEmpty {
+            let (url, name) = queue.removeFirst()
+            if ArchiveExtractor.isArchive(url) {
+                // Archives inside a multi-file drop: take every wallpaper in them.
+                if let files = try? await ArchiveExtractor.extract(url) {
+                    queue.insert(contentsOf: files.map { ($0, Optional($0.deletingPathExtension().lastPathComponent)) }, at: 0)
+                }
+                continue
+            }
+            if let item = await convert(url, name: name ?? url.deletingPathExtension().lastPathComponent) {
+                added = item
+            }
+        }
+        ArchiveExtractor.cleanup()
+        guard let added else { return }
+        items = library.items
+        busy = "Добавление в Системные настройки…"
+        await SystemWallpaper.sync(items)
+        busy = nil
+        select(added)
+    }
+
+    private func convert(_ url: URL, name: String) async -> WallpaperItem? {
+        busy = queue.isEmpty ? "Конвертация…" : "Конвертация… (ещё \(queue.count))"
+        progress = 0
+        defer { busy = nil; progress = nil }
+        let tmp = AppPaths.support.appendingPathComponent("incoming.mov")
+        do {
+            let result = try await MediaConverter.convert(url, to: tmp, screen: Self.screenSize()) { value in
+                Task { @MainActor [weak self] in if self?.busy != nil { self?.progress = value } }
+            }
+            if result.upscale > 2 {
+                let s = result.sourceSize
+                warning = "\(name): исходник \(Int(s.width))×\(Int(s.height)) растянут в \(Int(result.upscale.rounded()))× — будет размыто"
+            }
+            let item = try await library.add(video: tmp, name: name)
+            items = library.items
+            return item
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            self.error = "\(name): \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func openPanel() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = MediaConverter.allowedTypes + [.zip]
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         NSApp.activate(ignoringOtherApps: true)
-        if panel.runModal() == .OK, let url = panel.url { choose(url) }
+        if panel.runModal() == .OK { add(panel.urls) }
     }
+
+    func openSystemSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension")!)
+    }
+
+    // MARK: app lifecycle
 
     func setLaunchAtLogin(_ on: Bool) {
         do {
@@ -206,92 +260,17 @@ final class WallpaperController: ObservableObject {
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
-    private func load(_ url: URL, displayName: String? = nil) async {
-        error = nil
-        warning = nil
-        busy = "Конвертация…"
-        progress = 0
-        defer { busy = nil; progress = nil }
-        let fm = FileManager.default
-        let video = AppPaths.support.appendingPathComponent("incoming.mov")
-        do {
-            let result = try await MediaConverter.convert(url, to: video, screen: Self.screenSize()) { value in
-                Task { @MainActor [weak self] in
-                    if self?.busy != nil { self?.progress = value }
-                }
-            }
-            try? fm.removeItem(at: AppPaths.video)
-            try fm.moveItem(at: video, to: AppPaths.video)
-
-            sourceName = displayName ?? url.lastPathComponent
-            if result.upscale > 2 {
-                let s = result.sourceSize
-                warning = "Исходник \(Int(s.width))×\(Int(s.height)) растянут в \(Int(result.upscale.rounded()))× — будет размыто"
-            }
-            videoVersion += 1
-            // Picking a new file means the user wants it shown.
-            if !enabledStored {
-                enabledStored = true
-                objectWillChange.send()
-            }
-            applyDesktop()
-            await applyLock(previous: lockMode)
-        } catch {
-            try? fm.removeItem(at: video)
-            self.error = error.localizedDescription
-        }
+    /// On quit only the desktop animation stops; the library stays in System Settings, whose
+    /// lock screen and screen saver keep playing it, and the desktop shows the Aerial's still frame.
+    func stopDesktop() {
+        desktop.hide()
     }
 
-    private func applyDesktop() {
-        if enabled && hasVideo { desktop.show(video: AppPaths.video) } else { desktop.hide() }
-    }
-
-    private func applyLock(previous: LockMode) async {
-        guard hasVideo, enabled else { return }
-        error = nil
-        // Leaving the Aerial mode: put the system selection back first, the new mode starts from the original.
-        if previous == .animated && lockMode != .animated { await LockScreenWallpaper.restoreOriginal() }
-        do {
-            switch lockMode {
-            case .off:
-                // The lock screen shows the desktop picture, so "off" means the user's own wallpaper.
-                await LockScreenWallpaper.restoreOriginal()
-                cleanupStills()
-            case .still:
-                try await writeStill()
-                // Unique name each time: macOS caches desktop pictures by URL.
-                let url = AppPaths.support.appendingPathComponent("still-\(Int(Date().timeIntervalSince1970)).png")
-                cleanupStills()
-                try FileManager.default.copyItem(at: AppPaths.still, to: url)
-                try LockScreenWallpaper.setStatic(image: url)
-            case .animated:
-                guard LockScreenWallpaper.isSupported else {
-                    error = "Эта версия macOS не поддерживает анимированный экран блокировки"
-                    return
-                }
-                busy = "Экран блокировки…"
-                defer { busy = nil }
-                let long = AppPaths.support.appendingPathComponent("lock.mov")
-                try await MediaConverter.extend(AppPaths.video, to: long, duration: 3600)
-                let frame = try await MediaConverter.firstFrame(ofVideo: AppPaths.video)
-                try LockScreenWallpaper.setAnimated(video: long, thumbnail: frame)
-                try? FileManager.default.removeItem(at: long)
-            }
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
-
-    private func writeStill() async throws {
-        let frame = try await MediaConverter.firstFrame(ofVideo: AppPaths.video)
-        try MediaConverter.writePNG(frame, to: AppPaths.still)
-    }
-
-    private func cleanupStills() {
-        let items = (try? FileManager.default.contentsOfDirectory(at: AppPaths.support, includingPropertiesForKeys: nil)) ?? []
-        for item in items where item.lastPathComponent.hasPrefix("still-") {
-            try? FileManager.default.removeItem(at: item)
-        }
+    /// Uninstall: removes the library from System Settings and restores the original wallpaper.
+    func removeEverything() async {
+        desktop.hide()
+        storeWatcher = nil
+        await SystemWallpaper.removeAll()
     }
 
     /// Largest screen in pixels.

@@ -2,8 +2,8 @@ import AppKit
 import ServiceManagement
 
 /// macOS has no uninstall hook. While GifWall runs it watches its own bundle: when the app is moved to the Trash
-/// or deleted, it restores the system wallpaper, removes its data, settings and login item, and quits.
-/// (When it isn't running, quitting has already restored the wallpaper, so there is nothing left in the system.)
+/// or deleted, it removes its wallpapers from System Settings, restores the original wallpaper, deletes its
+/// data, settings and login item, and quits. (When it isn't running, uninstall.sh does the same.)
 @MainActor
 final class UninstallWatcher {
     private let bundleURL = Bundle.main.bundleURL
@@ -31,7 +31,7 @@ final class UninstallWatcher {
     }
 
     private func uninstall() async {
-        await WallpaperController.shared.restoreSystem()
+        await WallpaperController.shared.removeEverything()
         try? await SMAppService.mainApp.unregister()
         try? FileManager.default.removeItem(at: AppPaths.support)
         if let id = Bundle.main.bundleIdentifier {

@@ -1,31 +1,26 @@
 #!/bin/zsh
-# Removes GifWall completely and leaves the system wallpaper as it was before GifWall.
-# Usage: ./uninstall.sh
+# Removes GifWall completely: its wallpapers disappear from System Settings and the wallpaper from before
+# GifWall comes back. Usage: ./uninstall.sh
 set -u
 
 APP=/Applications/GifWall.app
 SUPPORT="$HOME/Library/Application Support/GifWall"
-WALLPAPER="$HOME/Library/Application Support/com.apple.wallpaper"
-ASSET=6F000000-0000-4000-8000-000000000010
 
-# Quitting normally makes GifWall restore the system wallpaper itself.
+if [[ -d "$APP" ]]; then
+  # GifWall cleans up after itself when its bundle disappears while it runs (see UninstallWatcher).
+  pgrep -x GifWall >/dev/null || { open -g "$APP"; sleep 3; }
+  echo "Removing GifWall and its wallpapers from System Settings…"
+  mv "$APP" "$HOME/.Trash/GifWall-$(date +%s).app"
+  for _ in {1..150}; do pgrep -x GifWall >/dev/null || break; sleep 0.1; done
+  rm -rf "$HOME"/.Trash/GifWall-*.app
+fi
+
 if pgrep -x GifWall >/dev/null; then
-  echo "Quitting GifWall (restores the wallpaper)…"
-  osascript -e 'tell application id "local.gifwall" to quit' 2>/dev/null
-  for _ in {1..100}; do pgrep -x GifWall >/dev/null || break; sleep 0.1; done
-  pkill -x GifWall 2>/dev/null
+  echo "GifWall didn't finish cleaning up; quit it and run this script again." >&2
+  exit 1
 fi
 
-# Leftovers from a crash: launching once lets GifWall finish the restore, then it quits.
-if [[ -f "$SUPPORT/Index.plist.backup" || -f "$WALLPAPER/aerials/videos/$ASSET.mov" ]] && [[ -d "$APP" ]]; then
-  echo "Finishing an interrupted restore…"
-  open -g "$APP"
-  sleep 4
-  osascript -e 'tell application id "local.gifwall" to quit' 2>/dev/null
-  for _ in {1..100}; do pgrep -x GifWall >/dev/null || break; sleep 0.1; done
-fi
-
-rm -rf "$APP" "$SUPPORT"
+rm -rf "$SUPPORT"
 defaults delete local.gifwall 2>/dev/null
 rm -f "$HOME/Library/Preferences/local.gifwall.plist"
 echo "GifWall removed."

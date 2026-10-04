@@ -30,9 +30,12 @@ final class DesktopWallpaper {
     }
 
     func show(video: URL) {
+        guard video != videoURL || windows.isEmpty else { return }
         videoURL = video
         rebuild()
     }
+
+    func isShowing(_ video: URL?) -> Bool { video != nil && video == videoURL && !windows.isEmpty }
 
     func hide() {
         videoURL = nil
@@ -101,6 +104,8 @@ private final class WallpaperWindow: NSWindow {
         looper?.disableLooping()
         looper = nil
         player.removeAllItems()
-        orderOut(nil)
+        contentView = nil
+        // close(), not just orderOut: the window server keeps hidden windows (and their layers) around.
+        close()
     }
 }
