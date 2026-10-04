@@ -1,0 +1,6 @@
+.build/
+build/
+Windows/lib/
+Windows/dist/
+Windows/GifWall/bin/
+Windows/GifWall/obj/
