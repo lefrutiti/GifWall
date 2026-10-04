@@ -33,6 +33,9 @@ enum MediaConverter {
     /// Longest output side. 4K-class sources are kept as is, bigger ones are downscaled.
     static let maxSide: CGFloat = 4096
 
+    /// A wallpaper is ambient motion: 30 fps looks the same as 60 and halves decoding and compositing work.
+    static let maxFps: Double = 30
+
     /// Videos longer than this are trimmed: a wallpaper doesn't need more, and conversion time grows linearly.
     static let maxVideoDuration: Double = 600
 
@@ -54,7 +57,7 @@ enum MediaConverter {
     static func convert(_ src: URL, to out: URL, screen: CGSize, progress: Progress? = nil) async throws -> Result {
         try? FileManager.default.removeItem(at: out)
         let source = isVideo(src)
-            ? try await encodeVideo(src, to: out, progress: progress)
+            ? try await encodeVideo(src, to: out, screen: screen, progress: progress)
             : try await encodeImage(src, to: out, screen: screen, progress: progress)
         let cover = max(screen.width / source.width, screen.height / source.height)
         return Result(sourceSize: source, upscale: Double(cover))
@@ -100,7 +103,9 @@ enum MediaConverter {
 
     // MARK: video
 
-    private static func encodeVideo(_ src: URL, to out: URL, progress: Progress?) async throws -> CGSize {
+    /// Downscaled to what it takes to cover `screen` (bigger frames are thrown away by the aspect-fill anyway),
+    /// at most `maxFps`. Never upscaled: that only costs CPU without adding detail.
+    private static func encodeVideo(_ src: URL, to out: URL, screen: CGSize, progress: Progress?) async throws -> CGSize {
         let asset = AVURLAsset(url: src)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               try await asset.load(.isReadable) else { throw MediaConverterError.unsupported }
@@ -112,16 +117,19 @@ enum MediaConverter {
         guard duration > 0 else { throw MediaConverterError.empty }
         let timeRange = CMTimeRange(start: range.start, duration: CMTime(seconds: duration, preferredTimescale: 600))
 
+        let fps = nominalFps > 0 ? min(Double(nominalFps), maxFps) : maxFps
+        let cover = max(screen.width / sourceSize.width, screen.height / sourceSize.height)
+        let (w, h) = fitted(sourceSize, scale: min(1, cover))
+
         // HEVC that already fits: copy the stream untouched, zero quality loss.
         let isHEVC = formats.first.map { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_HEVC } ?? false
-        if isHEVC && transform.isIdentity && max(sourceSize.width, sourceSize.height) <= maxSide {
+        let fits = CGFloat(w) >= sourceSize.width - 2 && CGFloat(h) >= sourceSize.height - 2 && Double(nominalFps) <= maxFps + 0.5
+        if isHEVC && transform.isIdentity && fits {
             try await copyVideoTrack(track, range: timeRange, to: out)
             progress?(1)
             return sourceSize
         }
 
-        let fps = nominalFps > 0 ? min(Double(nominalFps), 60) : 30
-        let (w, h) = fitted(sourceSize)
         let target = CGRect(x: 0, y: 0, width: w, height: h)
         // Source frames arrive with the track's rotation applied; only scale (same aspect, nothing is cropped).
         let composition = try await AVMutableVideoComposition.videoComposition(with: asset) { request in
@@ -150,12 +158,19 @@ enum MediaConverter {
 
         var start: CMTime?
         var last = CMTime.zero
+        // The reader delivers every source frame regardless of frameDuration; drop the extra ones here.
+        let step = 1 / fps
+        var next = 0.0
         while let sample = output.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             if start == nil {
                 start = pts
                 writer.startSession(atSourceTime: pts)
             }
+            let t = (pts - start!).seconds
+            // Small tolerance so 59.94 fps sources keep an even every-other-frame cadence.
+            if t + step * 0.25 < next { continue }
+            next = max(next + step, t)
             try await waitReady(input)
             guard input.append(sample) else { throw MediaConverterError.writerFailed(writer.error?.localizedDescription ?? "?") }
             last = pts
@@ -204,7 +219,7 @@ enum MediaConverter {
         let delays = (0..<count).map { delay(source, $0) }
         let loopDuration = delays.reduce(0, +)
         let loops = max(1, Int((minDuration / loopDuration).rounded(.up)))
-        let fps = min(60, Double(count) / loopDuration)
+        let fps = min(maxFps, Double(count) / loopDuration)
 
         let (writer, input) = try makeWriter(out, width: w, height: h, fps: fps)
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
@@ -278,6 +293,15 @@ enum MediaConverter {
     }
 
     // MARK: helpers
+
+    /// Whether a previously converted video is bigger or faster than `convert` would produce today
+    /// (files from versions without the screen/fps limits).
+    static func needsOptimizing(_ url: URL, screen: CGSize) async -> Bool {
+        guard let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first,
+              let (fps, natural) = try? await track.load(.nominalFrameRate, .naturalSize) else { return false }
+        let cover = max(screen.width / natural.width, screen.height / natural.height)
+        return Double(fps) > maxFps + 0.5 || cover < 0.9
+    }
 
     static func firstFrame(ofVideo url: URL) async throws -> CGImage {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))

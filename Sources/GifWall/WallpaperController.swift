@@ -84,7 +84,39 @@ final class WallpaperController: ObservableObject {
                 applyDesktop()
                 await applyLock(previous: .off)
             }
+            await optimizeExistingVideo()
         }
+    }
+
+    /// Videos chosen with older versions were kept at full size and frame rate; shrink them once, like new files are.
+    private func optimizeExistingVideo() async {
+        guard hasVideo, busy == nil,
+              await MediaConverter.needsOptimizing(AppPaths.video, screen: Self.screenSize()) else { return }
+        busy = "Оптимизация…"
+        progress = 0
+        let fm = FileManager.default
+        let video = AppPaths.support.appendingPathComponent("incoming.mov")
+        do {
+            try await MediaConverter.convert(AppPaths.video, to: video, screen: Self.screenSize()) { value in
+                Task { @MainActor [weak self] in
+                    if self?.busy != nil { self?.progress = value }
+                }
+            }
+            try? fm.removeItem(at: AppPaths.video)
+            try fm.moveItem(at: video, to: AppPaths.video)
+            busy = nil
+            progress = nil
+            videoVersion += 1
+            if enabled {
+                applyDesktop()
+                await applyLock(previous: lockMode)
+            }
+        } catch {
+            // Not worth bothering the user: the old video keeps working as before.
+            try? fm.removeItem(at: video)
+        }
+        busy = nil
+        progress = nil
     }
 
     /// Undo everything GifWall changed in the system (on quit). Settings and the chosen file are kept.

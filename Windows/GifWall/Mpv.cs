@@ -79,6 +79,9 @@ sealed class Mpv : IDisposable
         ["audio"] = "no",
         ["sub-auto"] = "no",
         ["panscan"] = "1.0",
+        // A wallpaper is ambient motion: 30 fps looks the same as 60 and halves rendering and compositing work.
+        // Frames are dropped before rendering (decoding still runs on the GPU decoder, which is cheap).
+        ["vf"] = "fps=30:round=near",
         ["osd-level"] = "0",
         ["input-default-bindings"] = "no",
         ["input-vo-keyboard"] = "no",
