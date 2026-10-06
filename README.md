@@ -1,5 +1,7 @@
 # GifWall
 
+**English** · [Русский](README.ru.md)
+
 Live wallpapers for macOS: videos and animated GIFs on the desktop and the lock screen.
 
 GifWall lives in the menu bar. Drop in a video, GIF or ZIP and it becomes a wallpaper in
