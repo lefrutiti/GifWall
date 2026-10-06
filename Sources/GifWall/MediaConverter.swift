@@ -69,37 +69,6 @@ enum MediaConverter {
         return (max(2, Int((size.width * s).rounded()) & ~1), max(2, Int((size.height * s).rounded()) & ~1))
     }
 
-    // MARK: writer
-
-    private static func makeWriter(_ out: URL, width: Int, height: Int, fps: Double) throws -> (AVAssetWriter, AVAssetWriterInput) {
-        let writer = try AVAssetWriter(outputURL: out, fileType: .mov)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            // Constant quality instead of a fixed bitrate: detailed footage gets the bits it needs.
-            AVVideoCompressionPropertiesKey: [
-                AVVideoQualityKey: 0.9,
-                AVVideoExpectedSourceFrameRateKey: fps,
-            ],
-        ])
-        input.expectsMediaDataInRealTime = false
-        writer.add(input)
-        return (writer, input)
-    }
-
-    private static func finish(_ writer: AVAssetWriter, _ input: AVAssetWriterInput, at end: CMTime) async throws {
-        input.markAsFinished()
-        writer.endSession(atSourceTime: end)
-        await writer.finishWriting()
-        if writer.status != .completed {
-            throw MediaConverterError.writerFailed(writer.error?.localizedDescription ?? "?")
-        }
-    }
-
-    private static func waitReady(_ input: AVAssetWriterInput) async throws {
-        while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 2_000_000) }
-    }
 
     // MARK: video
 
@@ -109,8 +78,8 @@ enum MediaConverter {
         let asset = AVURLAsset(url: src)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               try await asset.load(.isReadable) else { throw MediaConverterError.unsupported }
-        let (nominalFps, range, natural, transform, formats) = try await track.load(
-            .nominalFrameRate, .timeRange, .naturalSize, .preferredTransform, .formatDescriptions)
+        let (nominalFps, range, natural, transform) = try await track.load(
+            .nominalFrameRate, .timeRange, .naturalSize, .preferredTransform)
         let display = natural.applying(transform)
         let sourceSize = CGSize(width: abs(display.width), height: abs(display.height))
         let duration = min(range.duration.seconds, maxVideoDuration)
@@ -121,15 +90,7 @@ enum MediaConverter {
         let cover = max(screen.width / sourceSize.width, screen.height / sourceSize.height)
         let (w, h) = fitted(sourceSize, scale: min(1, cover))
 
-        // HEVC that already fits: copy the stream untouched, zero quality loss.
-        let isHEVC = formats.first.map { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_HEVC } ?? false
-        let fits = CGFloat(w) >= sourceSize.width - 2 && CGFloat(h) >= sourceSize.height - 2 && Double(nominalFps) <= maxFps + 0.5
-        if isHEVC && transform.isIdentity && fits {
-            try await copyVideoTrack(track, range: timeRange, to: out)
-            progress?(1)
-            return sourceSize
-        }
-
+        // Always re-encoded, even HEVC that fits: the lock screen needs the temporal layers (see LayeredHEVCWriter).
         let target = CGRect(x: 0, y: 0, width: w, height: h)
         // Source frames arrive with the track's rotation applied; only scale (same aspect, nothing is cropped).
         let composition = try await AVMutableVideoComposition.videoComposition(with: asset) { request in
@@ -153,8 +114,7 @@ enum MediaConverter {
         reader.add(output)
         guard reader.startReading() else { throw MediaConverterError.writerFailed(reader.error?.localizedDescription ?? "?") }
 
-        let (writer, input) = try makeWriter(out, width: w, height: h, fps: fps)
-        guard writer.startWriting() else { throw MediaConverterError.writerFailed(writer.error?.localizedDescription ?? "?") }
+        let writer = try LayeredHEVCWriter(url: out, width: w, height: h, fps: fps)
 
         var start: CMTime?
         var last = CMTime.zero
@@ -162,42 +122,22 @@ enum MediaConverter {
         let step = 1 / fps
         var next = 0.0
         while let sample = output.copyNextSampleBuffer() {
+            guard let pixels = CMSampleBufferGetImageBuffer(sample) else { continue }
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            if start == nil {
-                start = pts
-                writer.startSession(atSourceTime: pts)
-            }
+            if start == nil { start = pts }
             let t = (pts - start!).seconds
             // Small tolerance so 59.94 fps sources keep an even every-other-frame cadence.
             if t + step * 0.25 < next { continue }
             next = max(next + step, t)
-            try await waitReady(input)
-            guard input.append(sample) else { throw MediaConverterError.writerFailed(writer.error?.localizedDescription ?? "?") }
-            last = pts
-            progress?(min(1, (pts - start!).seconds / duration))
+            // Rebased to zero: trimmed or edited sources may not start there.
+            try await writer.append(pixels, at: pts - start!)
+            last = pts - start!
+            progress?(min(1, t / duration))
         }
         if reader.status == .failed { throw MediaConverterError.writerFailed(reader.error?.localizedDescription ?? "?") }
         guard start != nil else { throw MediaConverterError.empty }
-        try await finish(writer, input, at: last + composition.frameDuration)
+        try await writer.finish(at: last + composition.frameDuration)
         return sourceSize
-    }
-
-    /// Video track only (audio dropped), samples copied as is.
-    private static func copyVideoTrack(_ track: AVAssetTrack, range: CMTimeRange, to out: URL) async throws {
-        let comp = AVMutableComposition()
-        guard let ct = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
-              let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else {
-            throw MediaConverterError.writerFailed("export")
-        }
-        try ct.insertTimeRange(range, of: track, at: .zero)
-        if #available(macOS 15, *) {
-            try await export.export(to: out, as: .mov)
-        } else {
-            export.outputURL = out
-            export.outputFileType = .mov
-            await export.export()
-            if let error = export.error { throw error }
-        }
     }
 
     // MARK: animated images (GIF, WebP, APNG, HEICS)
@@ -221,14 +161,15 @@ enum MediaConverter {
         let loops = max(1, Int((minDuration / loopDuration).rounded(.up)))
         let fps = min(maxFps, Double(count) / loopDuration)
 
-        let (writer, input) = try makeWriter(out, width: w, height: h, fps: fps)
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+        let writer = try LayeredHEVCWriter(url: out, width: w, height: h, fps: fps)
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, nil, [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: w,
             kCVPixelBufferHeightKey as String: h,
-        ])
-        guard writer.startWriting() else { throw MediaConverterError.writerFailed(writer.error?.localizedDescription ?? "?") }
-        writer.startSession(atSourceTime: .zero)
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+        ] as CFDictionary, &pool)
+        guard let pool else { throw MediaConverterError.writerFailed("нет буфера") }
 
         let size = CGSize(width: w, height: h)
         let total = Double(count * loops)
@@ -236,21 +177,19 @@ enum MediaConverter {
         var written = 0
         for _ in 0..<loops {
             for i in 0..<count {
-                guard let image = CGImageSourceCreateImageAtIndex(source, i, nil),
-                      let pool = adaptor.pixelBufferPool else { continue }
+                guard let image = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
                 var pb: CVPixelBuffer?
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
                 guard let pb else { throw MediaConverterError.writerFailed("нет буфера") }
                 draw(image, into: pb, size: size)
-                try await waitReady(input)
-                adaptor.append(pb, withPresentationTime: t)
+                try await writer.append(pb, at: t)
                 t = t + CMTime(seconds: delays[i], preferredTimescale: 600)
                 written += 1
                 progress?(Double(written) / total)
             }
         }
         guard written > 0 else { throw MediaConverterError.empty }
-        try await finish(writer, input, at: t)
+        try await writer.finish(at: t)
         return sourceSize
     }
 
@@ -300,7 +239,20 @@ enum MediaConverter {
         guard let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first,
               let (fps, natural) = try? await track.load(.nominalFrameRate, .naturalSize) else { return false }
         let cover = max(screen.width / natural.width, screen.height / natural.height)
-        return Double(fps) > maxFps + 0.5 || cover < 0.9
+        return Double(fps) > maxFps + 0.5 || cover < 0.9 || !hasTemporalLayers(url)
+    }
+
+    /// Whether the file carries HEVC temporal-layer sample groups (`tscl`), which the lock screen needs.
+    /// Older versions wrote single-layer streams; those are re-encoded once.
+    static func hasTemporalLayers(_ url: URL) -> Bool {
+        // The movie header sits at the end of our files; the group type appears in plain text inside it.
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let tail = min(size, 4 << 20)
+        try? fh.seek(toOffset: size - tail)
+        guard let data = try? fh.read(upToCount: Int(tail)) else { return false }
+        return data.range(of: Data("tscl".utf8)) != nil
     }
 
     static func firstFrame(ofVideo url: URL) async throws -> CGImage {

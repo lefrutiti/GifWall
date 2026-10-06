@@ -105,7 +105,8 @@ final class WallpaperController: ObservableObject {
         Task { await SystemWallpaper.sync(items) }
     }
 
-    /// Videos added with older versions were kept at full size and frame rate; shrink them once, like new files are.
+    /// Videos added with older versions are re-encoded once, like new files are: smaller size and frame rate,
+    /// and the temporal layers without which the lock screen freezes (see LayeredHEVCWriter).
     private func optimizeExisting() async {
         for item in items where busy == nil {
             guard await MediaConverter.needsOptimizing(item.video, screen: Self.screenSize()) else { continue }
